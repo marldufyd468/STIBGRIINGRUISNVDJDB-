@@ -1,512 +1,729 @@
 const {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  PermissionsBitField
-} = require('discord.js');
+Client,
+GatewayIntentBits,
+PermissionsBitField
+} = require(“discord.js”);
+
 const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState
-} = require('@discordjs/voice');
-const play = require('play-dl');
-const express = require('express');
+joinVoiceChannel,
+createAudioPlayer,
+createAudioResource,
+AudioPlayerStatus,
+VoiceConnectionStatus,
+NoSubscriberBehavior,
+entersState
+} = require(”@discordjs/voice”);
 
-// ==========================================
-// 1. Web Server for Render
-// ==========================================
-const app = express();
-const PORT = process.env.PORT || 8080;
+const play = require(“play-dl”);
 
-app.get('/', (req, res) => {
-  res.status(200).send('Bot is running healthy.');
-});
+// ============================================================
+// CONFIG
+// ============================================================
 
-app.listen(PORT, () => {
-  console.log(`[HTTP] Express running on port ${PORT}`);
-});
+// إذا عندك التوكن موجود بطريقة ثانية، حافظ على طريقتك الحالية.
+// الأفضل وضعه في Environment Variable باسم DISCORD_TOKEN.
+const TOKEN = process.env.DISCORD_TOKEN || “PUT_YOUR_BOT_TOKEN_HERE”;
 
-// ==========================================
-// 2. Token Validation
-// ==========================================
-const TOKEN = process.env.DISCORD_TOKEN;
-if (!TOKEN) {
-  console.error('[FATAL] DISCORD_TOKEN is missing in environment variables.');
-  process.exit(1);
-}
+// ============================================================
+// CLIENT
+// ============================================================
 
-// ==========================================
-// 3. Client Initialization
-// ==========================================
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates
-  ]
+intents: [
+GatewayIntentBits.Guilds,
+GatewayIntentBits.GuildVoiceStates,
+GatewayIntentBits.GuildMessages,
+GatewayIntentBits.MessageContent
+]
 });
 
-const queues = new Map();
+// ============================================================
+// SERVER MUSIC STATES
+// ============================================================
 
-function createGuildQueue(guildId, voiceChannel, textChannel) {
-  const player = createAudioPlayer();
+const guildStates = new Map();
 
-  const queue = {
-    guildId,
-    voiceChannel,
-    textChannel,
-    connection: null,
-    player,
-    songs: [],
-    currentSong: null,
-    currentResource: null,
-    volume: 100,
-    loopMode: 'off',
-    isPlaying: false,
-    isPaused: false,
-    currentSeconds: 0,
-    timeInterval: null,
-    isHandlingManualTransition: false
-  };
-
-  attachPlayerEvents(queue);
-  queues.set(guildId, queue);
-  return queue;
+function getState(guildId) {
+if (!guildStates.has(guildId)) {
+const player = createAudioPlayer({
+behaviors: {
+noSubscriber: NoSubscriberBehavior.Pause
 }
+});
 
-function attachPlayerEvents(queue) {
-  queue.player.on('stateChange', (oldState, newState) => {
-    console.log(`[PLAYER] ${oldState.status} -> ${newState.status}`);
-
-    if (newState.status === AudioPlayerStatus.Playing) {
-      queue.isPlaying = true;
-      queue.isPaused = false;
-      startProgressTimer(queue);
-    } else if (newState.status === AudioPlayerStatus.Paused) {
-      queue.isPaused = true;
-      stopProgressTimer(queue);
-    } else if (newState.status === AudioPlayerStatus.Idle) {
-      queue.isPlaying = false;
-      stopProgressTimer(queue);
-
-      if (queue.isHandlingManualTransition) {
-        queue.isHandlingManualTransition = false;
-        return;
-      }
-
-      handleSongFinished(queue);
+const state = {
+  player,
+  connection: null,
+  queue: [],
+  current: null,
+  volume: 1.0,
+  repeat: false,
+  autoplay: false,
+  paused: false,
+  loading: false,
+  generation: 0
+};
+guildStates.set(guildId, state);
+// --------------------------------------------------------
+// TRACK ENDED
+// --------------------------------------------------------
+player.on(AudioPlayerStatus.Idle, async () => {
+  if (state.loading) return;
+  // إذا التراك الحالي انتهى
+  if (state.current) {
+    // تكرار نفس المقطع
+    if (state.repeat) {
+      const sameTrack = state.current;
+      state.current = null;
+      await playTrack(state, sameTrack);
+      return;
     }
-  });
-
-  queue.player.on('error', (error) => {
-    console.error(`[PLAYER ERROR]`, error.message);
-    queue.textChannel.send(`⚠️️ خطأ في تشغيل الصوت: ${error.message}`).catch(() => {});
-    queue.isHandlingManualTransition = false;
-    handleSongFinished(queue);
-  });
-}
-
-function startProgressTimer(queue) {
-  stopProgressTimer(queue);
-  queue.timeInterval = setInterval(() => {
-    if (queue.isPlaying && !queue.isPaused) {
-      queue.currentSeconds += 1;
-    }
-  }, 1000);
-}
-
-function stopProgressTimer(queue) {
-  if (queue.timeInterval) {
-    clearInterval(queue.timeInterval);
-    queue.timeInterval = null;
+    state.current = null;
   }
-}
-
-async function handleSongFinished(queue) {
-  if (queue.loopMode === 'single' && queue.currentSong) {
-    await playSong(queue, queue.currentSong, 0);
+  // تشغيل التالي من الطابور
+  if (state.queue.length > 0) {
+    const next = state.queue.shift();
+    await playTrack(state, next);
     return;
   }
-
-  queue.songs.shift();
-
-  if (queue.songs.length > 0) {
-    await playSong(queue, queue.songs[0], 0);
-  } else {
-    queue.textChannel.send('✅ انتهت قائمة التشغيل.').catch(() => {});
-    destroyQueue(queue.guildId);
+  // لا يوجد شيء في الطابور
+  // إذا autoplay ON نحاول تشغيل اقتراح/مقطع مرتبط
+  if (state.autoplay && state.current === null) {
+    console.log(`[${guildId}] Autoplay is enabled but queue is empty.`);
   }
+});
+// --------------------------------------------------------
+// ERROR
+// --------------------------------------------------------
+player.on("error", async (error) => {
+  console.error(`[PLAYER ERROR] ${error.message}`);
+  state.loading = false;
+  state.paused = false;
+  // لا نخلي خطأ مقطع واحد يوقف البوت بالكامل
+  if (state.queue.length > 0) {
+    const next = state.queue.shift();
+    setTimeout(() => {
+      playTrack(state, next).catch(console.error);
+    }, 1000);
+  }
+});
+
 }
 
-function destroyQueue(guildId) {
-  const queue = queues.get(guildId);
-  if (!queue) return;
-
-  stopProgressTimer(queue);
-
-  if (queue.player) {
-    queue.player.stop(true);
-  }
-
-  if (queue.connection) {
-    try {
-      queue.connection.destroy();
-    } catch (e) {
-      console.error(`[VOICE] Error destroying:`, e.message);
-    }
-  }
-
-  queues.delete(guildId);
+return guildStates.get(guildId);
 }
 
-async function ensureVoiceConnection(queue) {
-  const channel = queue.voiceChannel;
+// ============================================================
+// YOUTUBE URL CHECK
+// ============================================================
 
-  if (!queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed) {
-    console.log(`[VOICE] Joining channel: ${channel.name}...`);
-
-    const connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: true
-    });
-
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-        ]);
-      } catch (error) {
-        destroyQueue(queue.guildId);
-      }
-    });
-
-    queue.connection = connection;
-  }
-
-  try {
-    if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
-      await entersState(queue.connection, VoiceConnectionStatus.Ready, 15_000);
-      queue.connection.subscribe(queue.player);
-    }
-    return true;
-  } catch (error) {
-    queue.textChannel.send('❌ تعذر تثبيت الاتصال الصوتي مع ديسكورد.').catch(() => {});
-    destroyQueue(queue.guildId);
-    return false;
-  }
+function isYouTubeUrl(text) {
+return (
+/^https?://(www.)?(youtube.com|youtu.be)//i.test(text)
+);
 }
 
-async function playSong(queue, song, seekSeconds = 0) {
-  try {
-    const isReady = await ensureVoiceConnection(queue);
-    if (!isReady) return;
+// ============================================================
+// SEARCH YOUTUBE
+// ============================================================
 
-    console.log(`[PLAY] Getting stream for: ${song.title}`);
-    queue.isHandlingManualTransition = true;
-    queue.player.stop(true);
+async function findYouTube(query) {
+// إذا المستخدم حط رابط
+if (isYouTubeUrl(query)) {
+try {
+const info = await play.video_basic_info(query);
 
-    const streamOptions = { quality: 2 };
-    if (seekSeconds > 0) streamOptions.seek = seekSeconds;
-
-    const streamResult = await play.stream(song.url, streamOptions);
-
-    const resource = createAudioResource(streamResult.stream, {
-      inputType: streamResult.type,
-      inlineVolume: true
-    });
-
-    if (resource.volume) {
-      resource.volume.setVolume(queue.volume / 100);
-    }
-
-    queue.currentResource = resource;
-    queue.currentSong = song;
-    queue.currentSeconds = seekSeconds;
-
-    queue.player.play(resource);
-    console.log(`[PLAY] Playing successfully`);
-
-    if (seekSeconds === 0) {
-      sendControlPanel(queue, song);
-    }
-  } catch (error) {
-    console.error(`[PLAY] Failed:`, error.message);
-    queue.isHandlingManualTransition = false;
-    queue.textChannel.send(`❌ فشل تشغيل: ${song.title}`).catch(() => {});
-    handleSongFinished(queue);
-  }
+  return {
+    url: query,
+    title: info.video_details.title,
+    durationRaw: info.video_details.durationRaw || "Unknown",
+    thumbnail:
+      info.video_details.thumbnails?.[0]?.url || null
+  };
+} catch (error) {
+  throw new Error("ما قدرت أقرأ رابط اليوتيوب.");
 }
 
-function createControlComponents(queue) {
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('music_back').setEmoji('⏪').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_toggle').setEmoji(queue.isPaused ? '▶️' : '⏸️').setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('music_forward').setEmoji('⏩').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_replay').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary)
+}
+
+// بحث بالعنوان
+const results = await play.search(query, {
+limit: 1,
+source: {
+youtube: “video”
+}
+});
+
+if (!results || results.length === 0) {
+throw new Error(“ما لقيت أي مقطع بهذا الاسم.”);
+}
+
+const video = results[0];
+
+return {
+url: video.url,
+title: video.title,
+durationRaw: video.durationRaw || “Unknown”,
+thumbnail: video.thumbnails?.[0]?.url || null
+};
+}
+
+// ============================================================
+// CREATE AUDIO RESOURCE
+// ============================================================
+
+async function createTrackResource(track, volume) {
+// نحاول أخذ stream من YouTube
+const stream = await play.stream(track.url, {
+quality: 2,
+discordPlayerCompatibility: false
+});
+
+const resource = createAudioResource(stream.stream, {
+inputType: stream.type,
+inlineVolume: true
+});
+
+// 1.0 = 100%
+// 3.5 = 350%
+resource.volume.setVolume(volume);
+
+return resource;
+}
+
+// ============================================================
+// PLAY TRACK
+// ============================================================
+
+async function playTrack(state, track) {
+if (!state.connection) {
+throw new Error(“البوت غير متصل بالروم الصوتي.”);
+}
+
+state.loading = true;
+state.paused = false;
+
+try {
+console.log([PLAY] ${track.title});
+
+const resource = await createTrackResource(
+  track,
+  state.volume
+);
+state.current = track;
+state.player.play(resource);
+state.loading = false;
+return true;
+
+} catch (error) {
+state.loading = false;
+
+console.error(
+  `[TRACK ERROR] ${track.title}:`,
+  error.message
+);
+throw error;
+
+}
+}
+
+// ============================================================
+// CONNECT TO VOICE
+// ============================================================
+
+async function connectToVoice(message, state) {
+const member = message.member;
+
+if (!member || !member.voice.channel) {
+throw new Error(“ادخل روم صوتي أول.”);
+}
+
+const channel = member.voice.channel;
+
+const permissions = channel.permissionsFor(message.client.user);
+
+if (
+permissions &&
+!permissions.has(PermissionsBitField.Flags.Connect)
+) {
+throw new Error(“ما عندي صلاحية Connect في الروم.”);
+}
+
+if (
+permissions &&
+!permissions.has(PermissionsBitField.Flags.Speak)
+) {
+throw new Error(“ما عندي صلاحية Speak في الروم.”);
+}
+
+// إذا البوت أصلاً في نفس الروم
+if (
+state.connection &&
+state.connection.joinConfig.channelId === channel.id
+) {
+return state.connection;
+}
+
+// إذا كان في روم ثاني، ننقله
+if (state.connection) {
+try {
+state.connection.destroy();
+} catch {}
+}
+
+state.connection = joinVoiceChannel({
+channelId: channel.id,
+guildId: message.guild.id,
+adapterCreator: message.guild.voiceAdapterCreator,
+selfDeaf: true
+});
+
+state.connection.subscribe(state.player);
+
+try {
+await entersState(
+state.connection,
+VoiceConnectionStatus.Ready,
+30000
+);
+} catch (error) {
+try {
+state.connection.destroy();
+} catch {}
+
+state.connection = null;
+throw new Error(
+  "البوت حاول يدخل الروم لكنه ما قدر يثبت اتصال الصوت خلال 30 ثانية."
+);
+
+}
+
+return state.connection;
+}
+
+// ============================================================
+// MESSAGE COMMAND HANDLER
+// ============================================================
+
+client.on(“messageCreate”, async (message) => {
+if (message.author.bot) return;
+
+if (!message.guild) return;
+
+const content = message.content.trim();
+
+if (!content) return;
+
+const state = getState(message.guild.id);
+
+// ========================================================
+// HELP
+// ========================================================
+
+if (
+content === “مساعدة” ||
+content === “help”
+) {
+return message.reply(
+[
+“أوامر الموسيقى:”,
+“”,
+“شغل اسم المقطع — يبحث في YouTube ويشغله”,
+“شغل رابط اليوتيوب — يشغل الرابط مباشرة”,
+“تخطي — المقطع التالي”,
+“ايقاف — إيقاف التشغيل ومسح الطابور”,
+“مؤقت — إيقاف مؤقت”,
+“كمل — استئناف”,
+“اعادة — إعادة المقطع الحالي”,
+“تكرار on — تكرار المقطع الحالي”,
+“تكرار off — إيقاف التكرار”,
+“تلقائي on — تشغيل الوضع التلقائي”,
+“تلقائي off — إيقاف الوضع التلقائي”,
+“صوت 1-350 — تغيير الصوت”,
+“اطلع — خروج البوت من الروم”,
+“مساعدة — عرض الأوامر”
+].join(”\n”)
+);
+}
+
+// ========================================================
+// PLAY
+// ========================================================
+
+if (
+content.startsWith(“شغل “) ||
+content.startsWith(“شغّل “) ||
+content.startsWith(“play “)
+) {
+const query = content
+.replace(/^شغل\s+/i, “”)
+.replace(/^شغّل\s+/i, “”)
+.replace(/^play\s+/i, “”)
+.trim();
+
+if (!query) {
+  return message.reply(
+    "اكتب اسم المقطع أو رابط YouTube."
   );
-
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('music_voldown').setLabel('الصوت -10').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_volup').setLabel('الصوت +10').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_loop').setLabel(queue.loopMode === 'single' ? 'التكرار: مفعل' : 'التكرار: معطل').setStyle(queue.loopMode === 'single' ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('music_stop').setLabel('إيقاف').setStyle(ButtonStyle.Danger)
+}
+try {
+  await connectToVoice(message, state);
+  await message.reply(
+    "🔎 أدور على المقطع وأتصل بـ YouTube..."
   );
-
-  return [row1, row2];
+  const track = await findYouTube(query);
+  // إذا ما فيه مقطع شغال
+  if (
+    !state.current &&
+    state.player.state.status === AudioPlayerStatus.Idle
+  ) {
+    await playTrack(state, track);
+    return message.reply(
+      `▶️ **${track.title}**\nالمدة: ${track.durationRaw}`
+    );
+  }
+  // إذا فيه مقطع شغال، نضيفه للطابور
+  state.queue.push(track);
+  return message.reply(
+    `➕ تمت الإضافة للطابور: **${track.title}**\n` +
+    `المركز: ${state.queue.length}`
+  );
+} catch (error) {
+  console.error(error);
+  return message.reply(
+    `❌ ${error.message || "صار خطأ أثناء تشغيل المقطع."}`
+  );
 }
 
-async function sendControlPanel(queue, song) {
-  const embed = new EmbedBuilder()
-    .setColor(0x2f3136)
-    .setTitle('🎵 قيد التشغيل الآن')
-    .setDescription(`**[${song.title}](${song.url})**`)
-    .addFields(
-      { name: 'المدة', value: song.durationRaw || 'غير محدد', inline: true },
-      { name: 'الصوت', value: `${queue.volume}%`, inline: true },
-      { name: 'المصدر', value: song.source || 'SoundCloud', inline: true }
-    )
-    .setThumbnail(song.thumbnail || null)
-    .setFooter({ text: `طلب بواسطة: ${song.requester}` });
-
-  await queue.textChannel.send({
-    embeds: [embed],
-    components: createControlComponents(queue)
-  }).catch(() => {});
 }
 
-// ==========================================
-// 4. Message Commands
-// ==========================================
-client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.guild) return;
+// ========================================================
+// PAUSE
+// ========================================================
 
-  const content = message.content.trim();
-  const args = content.split(/\s+/);
-  const command = args.shift().toLowerCase();
+if (
+content === “مؤقت” ||
+content === “pause”
+) {
+if (!state.current) {
+return message.reply(“ما فيه مقطع شغال.”);
+}
 
-  if (command === '!play' || command === '!p') {
-    const query = args.join(' ');
-    if (!query) return message.reply('اكتب اسم المقطع أو الرابط بعد الأمر.');
+const success = state.player.pause();
+if (success) {
+  state.paused = true;
+  return message.reply("⏸️ تم الإيقاف المؤقت.");
+}
+return message.reply("ما قدرت أوقف المقطع مؤقتًا.");
 
-    const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) return message.reply('ادخل روم صوتي أولاً.');
+}
 
-    const permissions = voiceChannel.permissionsFor(message.client.user);
-    if (!permissions.has(PermissionsBitField.Flags.Connect) || !permissions.has(PermissionsBitField.Flags.Speak)) {
-      return message.reply('❌ ينقص البوت صلاحية Connect أو Speak.');
-    }
+// ========================================================
+// RESUME
+// ========================================================
 
-    let songInfo = null;
+if (
+content === “كمل” ||
+content === “استئناف” ||
+content === “resume”
+) {
+if (!state.current) {
+return message.reply(“ما فيه مقطع متوقف.”);
+}
 
-    try {
-      console.log(`[SEARCH] Query: "${query}"`);
-      const validate = await play.validate(query);
+const success = state.player.unpause();
+if (success) {
+  state.paused = false;
+  return message.reply("▶️ كملنا التشغيل.");
+}
+return message.reply("ما قدرت أستأنف التشغيل.");
 
-      if (validate === 'so_track') {
-        const info = await play.soundcloud(query);
-        songInfo = {
-          title: info.name,
-          url: info.url,
-          durationRaw: info.durationInSec ? `${Math.floor(info.durationInSec / 60)}:${(info.durationInSec % 60).toString().padStart(2, '0')}` : '00:00',
-          thumbnail: info.thumbnail,
-          source: 'SoundCloud',
-          requester: message.author.tag
-        };
-      } else if (validate === 'yt_video') {
-        const info = await play.video_info(query);
-        songInfo = {
-          title: info.video_details.title,
-          url: info.video_details.url,
-          durationRaw: info.video_details.durationRaw,
-          thumbnail: info.video_details.thumbnails?.[0]?.url || null,
-          source: 'YouTube',
-          requester: message.author.tag
-        };
-      } else {
-        // البحث التلقائي عبر SoundCloud لتفادي حظر 429
-        const results = await play.search(query, {
-          source: { soundcloud: 'tracks' },
-          limit: 1
-        });
+}
 
-        if (!results || results.length === 0) {
-          return message.reply('❌ لم يتم العثور على نتائج.');
-        }
+// ========================================================
+// SKIP
+// ========================================================
 
-        const first = results[0];
-        songInfo = {
-          title: first.name,
-          url: first.url,
-          durationRaw: first.durationInSec ? `${Math.floor(first.durationInSec / 60)}:${(first.durationInSec % 60).toString().padStart(2, '0')}` : '00:00',
-          thumbnail: first.thumbnail,
-          source: 'SoundCloud',
-          requester: message.author.tag
-        };
-      }
-    } catch (err) {
-      console.error(`[SEARCH ERROR]`, err.message);
-      return message.reply(`❌ تعذر إيجاد المقطع: ${err.message}`);
-    }
+if (
+content === “تخطي” ||
+content === “التالي” ||
+content === “skip”
+) {
+if (!state.current) {
+return message.reply(“ما فيه مقطع شغال.”);
+}
 
-    let queue = queues.get(message.guild.id);
-    const isNew = !queue;
+// إيقاف الحالي
+state.player.stop();
+// إذا التكرار شغال، نخليه يتجاوز التكرار
+// ونشغل التالي فعليًا
+if (state.repeat) {
+  state.repeat = false;
+  setTimeout(() => {
+    state.repeat = true;
+  }, 100);
+}
+return message.reply("⏭️ تم التخطي.");
 
-    if (!queue) {
-      queue = createGuildQueue(message.guild.id, voiceChannel, message.channel);
-    } else {
-      queue.voiceChannel = voiceChannel;
-      queue.textChannel = message.channel;
-    }
+}
 
-    queue.songs.push(songInfo);
+// ========================================================
+// STOP
+// ========================================================
 
-    if (isNew || (!queue.isPlaying && !queue.isPaused)) {
-      await playSong(queue, queue.songs[0], 0);
-    } else {
-      message.reply(`📥 تمت الإضافة: **${songInfo.title}**`);
-    }
-  }
+if (
+content === “ايقاف” ||
+content === “وقف” ||
+content === “stop”
+) {
+state.queue = [];
+state.current = null;
+state.paused = false;
+state.loading = false;
 
-  if (command === '!vol' || command === '!volume') {
-    const queue = queues.get(message.guild.id);
-    if (!queue) return message.reply('لا يوجد شيء قيد التشغيل حالياً.');
+state.player.stop();
+return message.reply(
+  "⏹️ تم إيقاف التشغيل ومسح الطابور."
+);
 
-    const newVol = parseInt(args[0], 10);
-    if (isNaN(newVol) || newVol < 0 || newVol > 350) {
-      return message.reply('اختر رقماً بين 0 و 350.');
-    }
+}
 
-    queue.volume = newVol;
-    if (queue.currentResource && queue.currentResource.volume) {
-      queue.currentResource.volume.setVolume(newVol / 100);
-    }
-    return message.reply(`🔊 تم ضبط الصوت إلى: ${newVol}%`);
-  }
-});
+// ========================================================
+// REPLAY CURRENT
+// ========================================================
 
-// ==========================================
-// 5. Button Handling
-// ==========================================
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton()) return;
+if (
+content === “اعادة” ||
+content === “إعادة” ||
+content === “اعادة تشغيل” ||
+content === “إعادة تشغيل” ||
+content === “replay”
+) {
+if (!state.current) {
+return message.reply(“ما فيه مقطع حالي لإعادته.”);
+}
 
-  const queue = queues.get(interaction.guildId);
-  if (!queue) return interaction.reply({ content: 'لا توجد قائمة نشطة.', ephemeral: true });
+const track = state.current;
+try {
+  state.player.stop();
+  await playTrack(state, track);
+  return message.reply(
+    `🔄 تمت إعادة: **${track.title}**`
+  );
+} catch (error) {
+  return message.reply(
+    `❌ فشلت إعادة المقطع: ${error.message}`
+  );
+}
 
-  if (interaction.member.voice.channelId !== queue.voiceChannel.id) {
-    return interaction.reply({ content: 'يجب أن تكون في نفس الروم.', ephemeral: true });
-  }
+}
 
-  await interaction.deferUpdate().catch(() => {});
+// ========================================================
+// REPEAT
+// ========================================================
 
-  switch (interaction.customId) {
-    case 'music_toggle': {
-      if (queue.isPaused) {
-        queue.player.unpause();
-        queue.isPaused = false;
-      } else {
-        queue.player.pause();
-        queue.isPaused = true;
-      }
-      await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
-      break;
-    }
+if (
+content.startsWith(“تكرار “) ||
+content.startsWith(“repeat “)
+) {
+const value = content
+.replace(/^تكرار\s+/i, “”)
+.replace(/^repeat\s+/i, “”)
+.trim()
+.toLowerCase();
 
-    case 'music_forward': {
-      if (!queue.currentSong) return;
-      await playSong(queue, queue.currentSong, queue.currentSeconds + 10);
-      break;
-    }
+if (
+  value === "on" ||
+  value === "تشغيل" ||
+  value === "1"
+) {
+  state.repeat = true;
+  return message.reply(
+    "🔁 **التكرار اللانهائي للمقطع الحالي: ON**"
+  );
+}
+if (
+  value === "off" ||
+  value === "ايقاف" ||
+  value === "إيقاف" ||
+  value === "0"
+) {
+  state.repeat = false;
+  return message.reply(
+    "🔁 **التكرار اللانهائي: OFF**"
+  );
+}
+return message.reply(
+  "استخدم: `تكرار on` أو `تكرار off`"
+);
 
-    case 'music_back': {
-      if (!queue.currentSong) return;
-      await playSong(queue, queue.currentSong, Math.max(0, queue.currentSeconds - 10));
-      break;
-    }
+}
 
-    case 'music_replay': {
-      if (!queue.currentSong) return;
-      await playSong(queue, queue.currentSong, 0);
-      break;
-    }
+// ========================================================
+// AUTOPLAY
+// ========================================================
 
-    case 'music_skip': {
-      queue.isHandlingManualTransition = true;
-      queue.player.stop(true);
-      queue.songs.shift();
+if (
+content.startsWith(“تلقائي “) ||
+content.startsWith(“autoplay “)
+) {
+const value = content
+.replace(/^تلقائي\s+/i, “”)
+.replace(/^autoplay\s+/i, “”)
+.trim()
+.toLowerCase();
 
-      if (queue.songs.length > 0) {
-        await playSong(queue, queue.songs[0], 0);
-      } else {
-        queue.textChannel.send('✅ انتهت القائمة.').catch(() => {});
-        destroyQueue(queue.guildId);
-      }
-      break;
-    }
+if (
+  value === "on" ||
+  value === "تشغيل" ||
+  value === "1"
+) {
+  state.autoplay = true;
+  return message.reply(
+    "▶️ **التشغيل التلقائي: ON**"
+  );
+}
+if (
+  value === "off" ||
+  value === "ايقاف" ||
+  value === "إيقاف" ||
+  value === "0"
+) {
+  state.autoplay = false;
+  return message.reply(
+    "⏹️ **التشغيل التلقائي: OFF**"
+  );
+}
+return message.reply(
+  "استخدم: `تلقائي on` أو `تلقائي off`"
+);
 
-    case 'music_voldown': {
-      queue.volume = Math.max(0, queue.volume - 10);
-      if (queue.currentResource && queue.currentResource.volume) {
-        queue.currentResource.volume.setVolume(queue.volume / 100);
-      }
-      await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
-      break;
-    }
+}
 
-    case 'music_volup': {
-      queue.volume = Math.min(350, queue.volume + 10);
-      if (queue.currentResource && queue.currentResource.volume) {
-        queue.currentResource.volume.setVolume(queue.volume / 100);
-      }
-      await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
-      break;
-    }
+// ========================================================
+// VOLUME
+// ========================================================
 
-    case 'music_loop': {
-      queue.loopMode = queue.loopMode === 'single' ? 'off' : 'single';
-      await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
-      break;
-    }
+if (
+content.startsWith(“صوت “) ||
+content.startsWith(“volume “)
+) {
+const value = content
+.replace(/^صوت\s+/i, “”)
+.replace(/^volume\s+/i, “”)
+.trim();
 
-    case 'music_stop': {
-      destroyQueue(queue.guildId);
-      await interaction.editReply({ content: '🛑 تم إيقاف التشغيل.', components: [] }).catch(() => {});
-      break;
-    }
-  }
-});
+const volume = Number(value);
+if (!Number.isFinite(volume)) {
+  return message.reply(
+    "اكتب رقم الصوت من `1` إلى `350`."
+  );
+}
+if (volume < 1 || volume > 350) {
+  return message.reply(
+    "الصوت لازم يكون بين `1` و `350`."
+  );
+}
+state.volume = volume / 100;
+// إذا فيه resource حالي، نحاول تغيير الصوت مباشرة
+const resource = state.player.state.resource;
+if (
+  resource &&
+  resource.volume
+) {
+  resource.volume.setVolume(state.volume);
+}
+return message.reply(
+  `🔊 تم ضبط الصوت على **${volume}%**.`
+);
 
-// ==========================================
-// 6. Bot Ready & Token Generation
-// ==========================================
-client.once('ready', async () => {
-  console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+}
 
+// ========================================================
+// LEAVE
+// ========================================================
+
+if (
+content === “اطلع” ||
+content === “اخرج” ||
+content === “leave” ||
+content === “disconnect”
+) {
+state.queue = [];
+state.current = null;
+state.paused = false;
+
+state.player.stop();
+if (state.connection) {
   try {
-    const scClientId = await play.getFreeClientID();
-    await play.setToken({
-      soundcloud: {
-        client_id: scClientId
-      }
-    });
-    console.log('[SOUNDCLOUD] Client ID initialized successfully.');
-  } catch (err) {
-    console.error('[SOUNDCLOUD] Failed to set client_id:', err.message);
+    state.connection.destroy();
+  } catch {}
+  state.connection = null;
+}
+return message.reply(
+  "👋 طلعت من الروم."
+);
+
+}
+
+// ========================================================
+// QUEUE
+// ========================================================
+
+if (
+content === “قائمة” ||
+content === “طابور” ||
+content === “queue”
+) {
+if (
+!state.current &&
+state.queue.length === 0
+) {
+return message.reply(
+“📭 الطابور فاضي.”
+);
+}
+
+let text = "🎵 **قائمة التشغيل**\n\n";
+if (state.current) {
+  text += `▶️ الآن: **${state.current.title}**\n\n`;
+}
+if (state.queue.length > 0) {
+  state.queue.slice(0, 20).forEach((track, index) => {
+    text += `${index + 1}. ${track.title}\n`;
+  });
+  if (state.queue.length > 20) {
+    text += `\n... و ${state.queue.length - 20} مقاطع أخرى`;
   }
+}
+return message.reply(text);
+
+}
 });
 
-client.login(TOKEN).catch((err) => {
-  console.error('[FATAL] Login error:', err.message);
-  process.exit(1);
+// ============================================================
+// READY
+// ============================================================
+
+client.once(“ready”, () => {
+console.log(”=================================”);
+console.log(Logged in as ${client.user.tag});
+console.log(“YouTube Music Bot is ONLINE”);
+console.log(”=================================”);
 });
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+if (
+!TOKEN ||
+TOKEN === “PUT_YOUR_BOT_TOKEN_HERE”
+) {
+console.error(
+“ERROR: ضع DISCORD_TOKEN في Environment Variables.”
+);
+process.exit(1);
+}
+
+client.login(TOKEN);
