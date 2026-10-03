@@ -13,10 +13,10 @@ const {
   createAudioResource,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  entersState,
-  getVoiceConnection
+  entersState
 } = require('@discordjs/voice');
-const play = require('play-dl');
+const ytdl = require('@distube/ytdl-core');
+const ytSearch = require('yt-search');
 const express = require('express');
 
 // ==========================================
@@ -54,12 +54,8 @@ const client = new Client({
   ]
 });
 
-// Per-guild queue map
 const queues = new Map();
 
-/**
- * Creates and initializes a Guild Queue structure.
- */
 function createGuildQueue(guildId, voiceChannel, textChannel) {
   const player = createAudioPlayer();
 
@@ -72,12 +68,11 @@ function createGuildQueue(guildId, voiceChannel, textChannel) {
     songs: [],
     currentSong: null,
     currentResource: null,
-    volume: 100, // 0 - 350
-    loopMode: 'off', // 'off' | 'single'
+    volume: 100,
+    loopMode: 'off',
     isPlaying: false,
     isPaused: false,
     currentSeconds: 0,
-    seekOffset: 0,
     timeInterval: null,
     isHandlingManualTransition: false
   };
@@ -87,9 +82,6 @@ function createGuildQueue(guildId, voiceChannel, textChannel) {
   return queue;
 }
 
-/**
- * Attaches audio player event listeners once per player.
- */
 function attachPlayerEvents(queue) {
   queue.player.on('stateChange', (oldState, newState) => {
     console.log(`[PLAYER] ${oldState.status} -> ${newState.status}`);
@@ -105,7 +97,6 @@ function attachPlayerEvents(queue) {
       queue.isPlaying = false;
       stopProgressTimer(queue);
 
-      // If transition was triggered by Skip/Seek/Replay, do not process natural finish
       if (queue.isHandlingManualTransition) {
         queue.isHandlingManualTransition = false;
         return;
@@ -116,10 +107,8 @@ function attachPlayerEvents(queue) {
   });
 
   queue.player.on('error', (error) => {
-    console.error(`[PLAYER ERROR] Error on current resource:`, error.message);
+    console.error(`[PLAYER ERROR]`, error.message);
     queue.textChannel.send(`⚠️ خطأ في تشغيل الصوت: ${error.message}`).catch(() => {});
-    
-    // Auto recover to next song
     queue.isHandlingManualTransition = false;
     handleSongFinished(queue);
   });
@@ -141,9 +130,6 @@ function stopProgressTimer(queue) {
   }
 }
 
-/**
- * Handles transition when a track completes naturally.
- */
 async function handleSongFinished(queue) {
   if (queue.loopMode === 'single' && queue.currentSong) {
     console.log(`[QUEUE] Replaying current song due to loop mode.`);
@@ -151,7 +137,6 @@ async function handleSongFinished(queue) {
     return;
   }
 
-  // Remove finished song
   queue.songs.shift();
 
   if (queue.songs.length > 0) {
@@ -164,9 +149,6 @@ async function handleSongFinished(queue) {
   }
 }
 
-/**
- * Safely disconnects and removes guild queue.
- */
 function destroyQueue(guildId) {
   const queue = queues.get(guildId);
   if (!queue) return;
@@ -189,9 +171,6 @@ function destroyQueue(guildId) {
   console.log(`[QUEUE] Cleaned up state for guild ${guildId}`);
 }
 
-/**
- * Ensures VoiceConnection is Ready and healthy.
- */
 async function ensureVoiceConnection(queue) {
   const channel = queue.voiceChannel;
 
@@ -212,7 +191,7 @@ async function ensureVoiceConnection(queue) {
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
-        console.warn(`[VOICE] Connection disconnected, attempting to reconnect...`);
+        console.warn(`[VOICE] Disconnected, attempting reconnect...`);
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
@@ -234,16 +213,13 @@ async function ensureVoiceConnection(queue) {
     }
     return true;
   } catch (error) {
-    console.error(`[VOICE] Failed to achieve Ready state within 15 seconds:`, error.message);
-    queue.textChannel.send('❌ تعذر تثبيت الاتصال الصوتي مع ديسكورد. تأكد من صلاحيات البوت.').catch(() => {});
+    console.error(`[VOICE] Failed to achieve Ready state:`, error.message);
+    queue.textChannel.send('❌ تعذر تثبيت الاتصال الصوتي مع ديسكورد.').catch(() => {});
     destroyQueue(queue.guildId);
     return false;
   }
 }
 
-/**
- * Extracts stream and plays a song at given seek time.
- */
 async function playSong(queue, song, seekSeconds = 0) {
   try {
     const isReady = await ensureVoiceConnection(queue);
@@ -252,27 +228,22 @@ async function playSong(queue, song, seekSeconds = 0) {
     console.log(`[PLAY] Getting audio stream for: ${song.title}`);
     console.log(`[PLAY] URL: ${song.url} (Seek: ${seekSeconds}s)`);
 
-    // Flag to ignore Idle triggered by stopping existing stream
     queue.isHandlingManualTransition = true;
     queue.player.stop(true);
 
-    const streamOptions = {
-      quality: 2
-    };
-    if (seekSeconds > 0) {
-      streamOptions.seek = seekSeconds;
-    }
+    // استخدام عملاء الموبايل لتخطي حظر الـ IP
+    const stream = ytdl(song.url, {
+      filter: 'audioonly',
+      quality: 'highestaudio',
+      highWaterMark: 1 << 25,
+      playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED']
+    });
 
-    const streamResult = await play.stream(song.url, streamOptions);
-    console.log(`[PLAY] Stream type: ${streamResult.type}`);
-
-    console.log(`[PLAY] Creating resource...`);
-    const resource = createAudioResource(streamResult.stream, {
-      inputType: streamResult.type,
+    console.log(`[PLAY] Creating audio resource...`);
+    const resource = createAudioResource(stream, {
       inlineVolume: true
     });
 
-    // Apply current volume
     if (resource.volume) {
       resource.volume.setVolume(queue.volume / 100);
     }
@@ -280,7 +251,6 @@ async function playSong(queue, song, seekSeconds = 0) {
     queue.currentResource = resource;
     queue.currentSong = song;
     queue.currentSeconds = seekSeconds;
-    queue.seekOffset = seekSeconds;
 
     queue.player.play(resource);
     console.log(`[PLAY] Playing successfully`);
@@ -292,65 +262,30 @@ async function playSong(queue, song, seekSeconds = 0) {
     console.error(`[PLAY] Failed`);
     console.error(`[PLAY] Error:`, error);
     queue.isHandlingManualTransition = false;
-    queue.textChannel.send(`❌ فشل استخراج أو تشغيل المقطع: ${song.title}\nالسبب: ${error.message}`).catch(() => {});
-    
-    // Skip to next track on stream extraction failure
+    queue.textChannel.send(`❌ فشل تشغيل المقطع: ${song.title}\nالسبب: ${error.message}`).catch(() => {});
     handleSongFinished(queue);
   }
 }
 
-/**
- * Builds interactive media control row.
- */
 function createControlComponents(queue) {
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('music_back')
-      .setEmoji('⏪')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_toggle')
-      .setEmoji(queue.isPaused ? '▶️' : '⏸️')
-      .setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId('music_forward')
-      .setEmoji('⏩')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_replay')
-      .setEmoji('🔄')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_skip')
-      .setEmoji('⏭️')
-      .setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('music_back').setEmoji('⏪').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_toggle').setEmoji(queue.isPaused ? '▶️' : '⏸️').setStyle(queue.isPaused ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('music_forward').setEmoji('⏩').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_replay').setEmoji('🔄').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_skip').setEmoji('⏭️').setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('music_voldown')
-      .setLabel('الصوت -10')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_volup')
-      .setLabel('الصوت +10')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_loop')
-      .setLabel(queue.loopMode === 'single' ? 'التكرار: مفعل' : 'التكرار: معطل')
-      .setStyle(queue.loopMode === 'single' ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('music_stop')
-      .setLabel('إيقاف')
-      .setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId('music_voldown').setLabel('الصوت -10').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_volup').setLabel('الصوت +10').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_loop').setLabel(queue.loopMode === 'single' ? 'التكرار: مفعل' : 'التكرار: معطل').setStyle(queue.loopMode === 'single' ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('music_stop').setLabel('إيقاف').setStyle(ButtonStyle.Danger)
   );
 
   return [row1, row2];
 }
 
-/**
- * Sends track info embed with controls.
- */
 async function sendControlPanel(queue, song) {
   const embed = new EmbedBuilder()
     .setColor(0x2f3136)
@@ -371,7 +306,7 @@ async function sendControlPanel(queue, song) {
 }
 
 // ==========================================
-// 4. Message Command Handler (!play, !vol, etc)
+// 4. Command Handler
 // ==========================================
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -382,61 +317,51 @@ client.on('messageCreate', async (message) => {
 
   if (command === '!play' || command === '!p') {
     const query = args.join(' ');
-    if (!query) {
-      return message.reply('يرجى كتابة اسم الأغنية أو الرابط بعد الأمر.');
-    }
+    if (!query) return message.reply('يرجى كتابة اسم الأغنية أو الرابط بعد الأمر.');
 
     const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) {
-      return message.reply('يجب أن تكون داخل روم صوتي لتشغيل البوت.');
-    }
+    if (!voiceChannel) return message.reply('يجب أن تكون داخل روم صوتي أولاً.');
 
-    // Permission checks
     const permissions = voiceChannel.permissionsFor(message.client.user);
-    if (!permissions.has(PermissionsBitField.Flags.Connect)) {
-      return message.reply('❌ البوت يفتقر إلى صلاحية الانضمام للروم الصوتي (`Connect`).');
-    }
-    if (!permissions.has(PermissionsBitField.Flags.Speak)) {
-      return message.reply('❌ البوت يفتقر إلى صلاحية التحدث في الروم الصوتي (`Speak`).');
-    }
+    if (!permissions.has(PermissionsBitField.Flags.Connect)) return message.reply('❌ ينقص البوت صلاحية Connect.');
+    if (!permissions.has(PermissionsBitField.Flags.Speak)) return message.reply('❌ ينقص البوت صلاحية Speak.');
 
     let songInfo = null;
 
     try {
       console.log(`[PLAY] Searching for: "${query}"`);
-      const validate = await play.validate(query);
 
-      if (validate === 'yt_video') {
-        const info = await play.video_info(query);
-        const details = info.video_details;
+      if (ytdl.validateURL(query)) {
+        const info = await ytdl.getInfo(query, {
+          playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED']
+        });
         songInfo = {
-          title: details.title || 'Unknown Title',
-          url: details.url,
-          durationRaw: details.durationRaw || '00:00',
-          durationInSec: details.durationInSec || 0,
-          thumbnail: details.thumbnails?.[0]?.url || null,
+          title: info.videoDetails.title,
+          url: info.videoDetails.video_url,
+          durationRaw: `${Math.floor(info.videoDetails.lengthSeconds / 60)}:${(info.videoDetails.lengthSeconds % 60).toString().padStart(2, '0')}`,
+          durationInSec: parseInt(info.videoDetails.lengthSeconds, 10),
+          thumbnail: info.videoDetails.thumbnails?.[0]?.url || null,
           requester: message.author.tag
         };
       } else {
-        const searchResults = await play.search(query, { limit: 1 });
-        if (!searchResults || searchResults.length === 0) {
-          return message.reply('❌ لم يتم العثور على أي نتائج مطابقة في YouTube.');
-        }
-        const first = searchResults[0];
+        const searchResult = await ytSearch(query);
+        const video = searchResult.videos?.[0];
+        if (!video) return message.reply('❌ لم يتم العثور على نتائج في يوتيوب.');
+
         songInfo = {
-          title: first.title || 'Unknown Title',
-          url: first.url,
-          durationRaw: first.durationRaw || '00:00',
-          durationInSec: first.durationInSec || 0,
-          thumbnail: first.thumbnails?.[0]?.url || null,
+          title: video.title,
+          url: video.url,
+          durationRaw: video.timestamp,
+          durationInSec: video.seconds,
+          thumbnail: video.thumbnail,
           requester: message.author.tag
         };
       }
 
       console.log(`[PLAY] Found: ${songInfo.title}`);
-    } catch (searchError) {
-      console.error(`[SEARCH ERROR]`, searchError);
-      return message.reply(`❌ تعذر البحث في YouTube: ${searchError.message}`);
+    } catch (err) {
+      console.error(`[SEARCH ERROR]`, err);
+      return message.reply(`❌ فشل جلب المقطع: ${err.message}`);
     }
 
     let queue = queues.get(message.guild.id);
@@ -458,14 +383,13 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // Volume command: !vol <0-350>
   if (command === '!vol' || command === '!volume') {
     const queue = queues.get(message.guild.id);
     if (!queue) return message.reply('لا يوجد شيء قيد التشغيل حالياً.');
 
     const newVol = parseInt(args[0], 10);
     if (isNaN(newVol) || newVol < 0 || newVol > 350) {
-      return message.reply('يرجى تحديد رقم صحيح للصوت بين 0 و 350.');
+      return message.reply('يرجى تحديد رقم صحيح بين 0 و 350.');
     }
 
     queue.volume = newVol;
@@ -477,18 +401,16 @@ client.on('messageCreate', async (message) => {
 });
 
 // ==========================================
-// 5. Button Interactions (Controls)
+// 5. Button Controls
 // ==========================================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   const queue = queues.get(interaction.guildId);
-  if (!queue) {
-    return interaction.reply({ content: 'لا توجد قائمة تشغيل نشطة حالياً.', ephemeral: true });
-  }
+  if (!queue) return interaction.reply({ content: 'لا توجد قائمة تشغيل نشطة.', ephemeral: true });
 
   if (interaction.member.voice.channelId !== queue.voiceChannel.id) {
-    return interaction.reply({ content: 'يجب أن تكون في نفس الروم الصوتي لاستخدام الأزرار.', ephemeral: true });
+    return interaction.reply({ content: 'يجب أن تكون في نفس الروم الصوتي.', ephemeral: true });
   }
 
   await interaction.deferUpdate().catch(() => {});
@@ -498,11 +420,9 @@ client.on('interactionCreate', async (interaction) => {
       if (queue.isPaused) {
         queue.player.unpause();
         queue.isPaused = false;
-        console.log(`[CONTROL] Unpaused track`);
       } else {
         queue.player.pause();
         queue.isPaused = true;
-        console.log(`[CONTROL] Paused track`);
       }
       await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
       break;
@@ -511,10 +431,6 @@ client.on('interactionCreate', async (interaction) => {
     case 'music_forward': {
       if (!queue.currentSong) return;
       const targetTime = queue.currentSeconds + 10;
-      if (queue.currentSong.durationInSec && targetTime >= queue.currentSong.durationInSec) {
-        return interaction.followUp({ content: 'لا يمكن التقديم لما بعد نهاية الأغنية.', ephemeral: true });
-      }
-      console.log(`[CONTROL] Forwarding 10s to ${targetTime}s`);
       await playSong(queue, queue.currentSong, targetTime);
       break;
     }
@@ -522,20 +438,17 @@ client.on('interactionCreate', async (interaction) => {
     case 'music_back': {
       if (!queue.currentSong) return;
       const targetTime = Math.max(0, queue.currentSeconds - 10);
-      console.log(`[CONTROL] Rewinding 10s to ${targetTime}s`);
       await playSong(queue, queue.currentSong, targetTime);
       break;
     }
 
     case 'music_replay': {
       if (!queue.currentSong) return;
-      console.log(`[CONTROL] Replaying track from start`);
       await playSong(queue, queue.currentSong, 0);
       break;
     }
 
     case 'music_skip': {
-      console.log(`[CONTROL] Skipping track`);
       queue.isHandlingManualTransition = true;
       queue.player.stop(true);
       queue.songs.shift();
@@ -543,7 +456,7 @@ client.on('interactionCreate', async (interaction) => {
       if (queue.songs.length > 0) {
         await playSong(queue, queue.songs[0], 0);
       } else {
-        queue.textChannel.send('✅ تم تخطي الأغنية وانتهت قائمة التشغيل.').catch(() => {});
+        queue.textChannel.send('✅ تم تخطي الأغنية وانتهت القائمة.').catch(() => {});
         destroyQueue(queue.guildId);
       }
       break;
@@ -554,7 +467,6 @@ client.on('interactionCreate', async (interaction) => {
       if (queue.currentResource && queue.currentResource.volume) {
         queue.currentResource.volume.setVolume(queue.volume / 100);
       }
-      console.log(`[CONTROL] Volume decreased to ${queue.volume}%`);
       await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
       break;
     }
@@ -564,29 +476,26 @@ client.on('interactionCreate', async (interaction) => {
       if (queue.currentResource && queue.currentResource.volume) {
         queue.currentResource.volume.setVolume(queue.volume / 100);
       }
-      console.log(`[CONTROL] Volume increased to ${queue.volume}%`);
       await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
       break;
     }
 
     case 'music_loop': {
       queue.loopMode = queue.loopMode === 'single' ? 'off' : 'single';
-      console.log(`[CONTROL] Loop mode set to: ${queue.loopMode}`);
       await interaction.editReply({ components: createControlComponents(queue) }).catch(() => {});
       break;
     }
 
     case 'music_stop': {
-      console.log(`[CONTROL] Stop requested`);
       destroyQueue(queue.guildId);
-      await interaction.editReply({ content: '🛑 تم إيقاف التشغيل ومغادرة الروم الصوتي.', components: [] }).catch(() => {});
+      await interaction.editReply({ content: '🛑 تم إيقاف التشغيل والمغادرة.', components: [] }).catch(() => {});
       break;
     }
   }
 });
 
 // ==========================================
-// 6. Bot Lifecycle Events & Login
+// 6. Login
 // ==========================================
 client.once('ready', () => {
   console.log(`[DISCORD] Logged in successfully as ${client.user.tag}`);
