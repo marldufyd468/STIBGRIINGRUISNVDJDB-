@@ -107,7 +107,7 @@ function attachPlayerEvents(queue) {
 
   queue.player.on('error', (error) => {
     console.error(`[PLAYER ERROR]`, error.message);
-    queue.textChannel.send(`⚠️ خطأ في تشغيل الصوت: ${error.message}`).catch(() => {});
+    queue.textChannel.send(`⚠️️ خطأ في تشغيل الصوت: ${error.message}`).catch(() => {});
     queue.isHandlingManualTransition = false;
     handleSongFinished(queue);
   });
@@ -487,8 +487,23 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.once('ready', () => {
+// ==========================================
+// 6. Bot Ready & Token Generation
+// ==========================================
+client.once('ready', async () => {
   console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+
+  try {
+    const scClientId = await play.getFreeClientID();
+    await play.setToken({
+      soundcloud: {
+        client_id: scClientId
+      }
+    });
+    console.log('[SOUNDCLOUD] Client ID initialized successfully.');
+  } catch (err) {
+    console.error('[SOUNDCLOUD] Failed to set client_id:', err.message);
+  }
 });
 
 client.login(TOKEN).catch((err) => {
