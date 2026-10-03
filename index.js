@@ -15,22 +15,21 @@ const {
   VoiceConnectionStatus,
   entersState
 } = require('@discordjs/voice');
-const ytdl = require('@distube/ytdl-core');
-const ytSearch = require('yt-search');
+const play = require('play-dl');
 const express = require('express');
 
 // ==========================================
-// 1. Web Server for Render Hosting
+// 1. Web Server for Render
 // ==========================================
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => {
-  res.status(200).send('Bot web service is healthy and active.');
+  res.status(200).send('Bot is running healthy.');
 });
 
 app.listen(PORT, () => {
-  console.log(`[HTTP] Express server running on port ${PORT}`);
+  console.log(`[HTTP] Express running on port ${PORT}`);
 });
 
 // ==========================================
@@ -132,7 +131,6 @@ function stopProgressTimer(queue) {
 
 async function handleSongFinished(queue) {
   if (queue.loopMode === 'single' && queue.currentSong) {
-    console.log(`[QUEUE] Replaying current song due to loop mode.`);
     await playSong(queue, queue.currentSong, 0);
     return;
   }
@@ -140,11 +138,9 @@ async function handleSongFinished(queue) {
   queue.songs.shift();
 
   if (queue.songs.length > 0) {
-    console.log(`[QUEUE] Playing next track in queue.`);
     await playSong(queue, queue.songs[0], 0);
   } else {
-    console.log(`[QUEUE] Queue ended. Cleaning up connection.`);
-    queue.textChannel.send('✅ انتهت قائمة التشغيل. تم مغادرة الروم الصوتي.').catch(() => {});
+    queue.textChannel.send('✅ انتهت قائمة التشغيل.').catch(() => {});
     destroyQueue(queue.guildId);
   }
 }
@@ -163,20 +159,18 @@ function destroyQueue(guildId) {
     try {
       queue.connection.destroy();
     } catch (e) {
-      console.error(`[VOICE] Error destroying connection:`, e.message);
+      console.error(`[VOICE] Error destroying:`, e.message);
     }
   }
 
   queues.delete(guildId);
-  console.log(`[QUEUE] Cleaned up state for guild ${guildId}`);
 }
 
 async function ensureVoiceConnection(queue) {
   const channel = queue.voiceChannel;
 
   if (!queue.connection || queue.connection.state.status === VoiceConnectionStatus.Destroyed) {
-    console.log(`[VOICE] Joining channel: ${channel.name} (${channel.id})...`);
-    console.log(`[VOICE] Connecting...`);
+    console.log(`[VOICE] Joining channel: ${channel.name}...`);
 
     const connection = joinVoiceChannel({
       channelId: channel.id,
@@ -185,19 +179,13 @@ async function ensureVoiceConnection(queue) {
       selfDeaf: true
     });
 
-    connection.on('stateChange', (oldState, newState) => {
-      console.log(`[VOICE STATE] ${oldState.status} -> ${newState.status}`);
-    });
-
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
-        console.warn(`[VOICE] Disconnected, attempting reconnect...`);
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
         ]);
       } catch (error) {
-        console.error(`[VOICE] Reconnect failed, destroying connection.`);
         destroyQueue(queue.guildId);
       }
     });
@@ -208,12 +196,10 @@ async function ensureVoiceConnection(queue) {
   try {
     if (queue.connection.state.status !== VoiceConnectionStatus.Ready) {
       await entersState(queue.connection, VoiceConnectionStatus.Ready, 15_000);
-      console.log(`[VOICE] Ready`);
       queue.connection.subscribe(queue.player);
     }
     return true;
   } catch (error) {
-    console.error(`[VOICE] Failed to achieve Ready state:`, error.message);
     queue.textChannel.send('❌ تعذر تثبيت الاتصال الصوتي مع ديسكورد.').catch(() => {});
     destroyQueue(queue.guildId);
     return false;
@@ -225,22 +211,17 @@ async function playSong(queue, song, seekSeconds = 0) {
     const isReady = await ensureVoiceConnection(queue);
     if (!isReady) return;
 
-    console.log(`[PLAY] Getting audio stream for: ${song.title}`);
-    console.log(`[PLAY] URL: ${song.url} (Seek: ${seekSeconds}s)`);
-
+    console.log(`[PLAY] Getting stream for: ${song.title}`);
     queue.isHandlingManualTransition = true;
     queue.player.stop(true);
 
-    // استخدام عملاء الموبايل لتخطي حظر الـ IP
-    const stream = ytdl(song.url, {
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25,
-      playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED']
-    });
+    const streamOptions = { quality: 2 };
+    if (seekSeconds > 0) streamOptions.seek = seekSeconds;
 
-    console.log(`[PLAY] Creating audio resource...`);
-    const resource = createAudioResource(stream, {
+    const streamResult = await play.stream(song.url, streamOptions);
+
+    const resource = createAudioResource(streamResult.stream, {
+      inputType: streamResult.type,
       inlineVolume: true
     });
 
@@ -259,10 +240,9 @@ async function playSong(queue, song, seekSeconds = 0) {
       sendControlPanel(queue, song);
     }
   } catch (error) {
-    console.error(`[PLAY] Failed`);
-    console.error(`[PLAY] Error:`, error);
+    console.error(`[PLAY] Failed:`, error.message);
     queue.isHandlingManualTransition = false;
-    queue.textChannel.send(`❌ فشل تشغيل المقطع: ${song.title}\nالسبب: ${error.message}`).catch(() => {});
+    queue.textChannel.send(`❌ فشل تشغيل: ${song.title}`).catch(() => {});
     handleSongFinished(queue);
   }
 }
@@ -294,7 +274,7 @@ async function sendControlPanel(queue, song) {
     .addFields(
       { name: 'المدة', value: song.durationRaw || 'غير محدد', inline: true },
       { name: 'الصوت', value: `${queue.volume}%`, inline: true },
-      { name: 'التكرار', value: queue.loopMode === 'single' ? 'مفعل' : 'معطل', inline: true }
+      { name: 'المصدر', value: song.source || 'SoundCloud', inline: true }
     )
     .setThumbnail(song.thumbnail || null)
     .setFooter({ text: `طلب بواسطة: ${song.requester}` });
@@ -306,7 +286,7 @@ async function sendControlPanel(queue, song) {
 }
 
 // ==========================================
-// 4. Command Handler
+// 4. Message Commands
 // ==========================================
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
@@ -317,55 +297,70 @@ client.on('messageCreate', async (message) => {
 
   if (command === '!play' || command === '!p') {
     const query = args.join(' ');
-    if (!query) return message.reply('يرجى كتابة اسم الأغنية أو الرابط بعد الأمر.');
+    if (!query) return message.reply('اكتب اسم المقطع أو الرابط بعد الأمر.');
 
     const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel) return message.reply('يجب أن تكون داخل روم صوتي أولاً.');
+    if (!voiceChannel) return message.reply('ادخل روم صوتي أولاً.');
 
     const permissions = voiceChannel.permissionsFor(message.client.user);
-    if (!permissions.has(PermissionsBitField.Flags.Connect)) return message.reply('❌ ينقص البوت صلاحية Connect.');
-    if (!permissions.has(PermissionsBitField.Flags.Speak)) return message.reply('❌ ينقص البوت صلاحية Speak.');
+    if (!permissions.has(PermissionsBitField.Flags.Connect) || !permissions.has(PermissionsBitField.Flags.Speak)) {
+      return message.reply('❌ ينقص البوت صلاحية Connect أو Speak.');
+    }
 
     let songInfo = null;
 
     try {
-      console.log(`[PLAY] Searching for: "${query}"`);
+      console.log(`[SEARCH] Query: "${query}"`);
+      const validate = await play.validate(query);
 
-      if (ytdl.validateURL(query)) {
-        const info = await ytdl.getInfo(query, {
-          playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED']
-        });
+      if (validate === 'so_track') {
+        const info = await play.soundcloud(query);
         songInfo = {
-          title: info.videoDetails.title,
-          url: info.videoDetails.video_url,
-          durationRaw: `${Math.floor(info.videoDetails.lengthSeconds / 60)}:${(info.videoDetails.lengthSeconds % 60).toString().padStart(2, '0')}`,
-          durationInSec: parseInt(info.videoDetails.lengthSeconds, 10),
-          thumbnail: info.videoDetails.thumbnails?.[0]?.url || null,
+          title: info.name,
+          url: info.url,
+          durationRaw: info.durationInSec ? `${Math.floor(info.durationInSec / 60)}:${(info.durationInSec % 60).toString().padStart(2, '0')}` : '00:00',
+          thumbnail: info.thumbnail,
+          source: 'SoundCloud',
+          requester: message.author.tag
+        };
+      } else if (validate === 'yt_video') {
+        const info = await play.video_info(query);
+        songInfo = {
+          title: info.video_details.title,
+          url: info.video_details.url,
+          durationRaw: info.video_details.durationRaw,
+          thumbnail: info.video_details.thumbnails?.[0]?.url || null,
+          source: 'YouTube',
           requester: message.author.tag
         };
       } else {
-        const searchResult = await ytSearch(query);
-        const video = searchResult.videos?.[0];
-        if (!video) return message.reply('❌ لم يتم العثور على نتائج في يوتيوب.');
+        // البحث التلقائي عبر SoundCloud لتفادي حظر 429
+        const results = await play.search(query, {
+          source: { soundcloud: 'tracks' },
+          limit: 1
+        });
 
+        if (!results || results.length === 0) {
+          return message.reply('❌ لم يتم العثور على نتائج.');
+        }
+
+        const first = results[0];
         songInfo = {
-          title: video.title,
-          url: video.url,
-          durationRaw: video.timestamp,
-          durationInSec: video.seconds,
-          thumbnail: video.thumbnail,
+          title: first.name,
+          url: first.url,
+          durationRaw: first.durationInSec ? `${Math.floor(first.durationInSec / 60)}:${(first.durationInSec % 60).toString().padStart(2, '0')}` : '00:00',
+          thumbnail: first.thumbnail,
+          source: 'SoundCloud',
           requester: message.author.tag
         };
       }
-
-      console.log(`[PLAY] Found: ${songInfo.title}`);
     } catch (err) {
-      console.error(`[SEARCH ERROR]`, err);
-      return message.reply(`❌ فشل جلب المقطع: ${err.message}`);
+      console.error(`[SEARCH ERROR]`, err.message);
+      return message.reply(`❌ تعذر إيجاد المقطع: ${err.message}`);
     }
 
     let queue = queues.get(message.guild.id);
-    const isNewQueue = !queue;
+    const isNew = !queue;
 
     if (!queue) {
       queue = createGuildQueue(message.guild.id, voiceChannel, message.channel);
@@ -376,10 +371,10 @@ client.on('messageCreate', async (message) => {
 
     queue.songs.push(songInfo);
 
-    if (isNewQueue || (!queue.isPlaying && !queue.isPaused)) {
+    if (isNew || (!queue.isPlaying && !queue.isPaused)) {
       await playSong(queue, queue.songs[0], 0);
     } else {
-      message.reply(`📥 تمت إضافة **${songInfo.title}** إلى قائمة الانتظار.`);
+      message.reply(`📥 تمت الإضافة: **${songInfo.title}**`);
     }
   }
 
@@ -389,7 +384,7 @@ client.on('messageCreate', async (message) => {
 
     const newVol = parseInt(args[0], 10);
     if (isNaN(newVol) || newVol < 0 || newVol > 350) {
-      return message.reply('يرجى تحديد رقم صحيح بين 0 و 350.');
+      return message.reply('اختر رقماً بين 0 و 350.');
     }
 
     queue.volume = newVol;
@@ -401,16 +396,16 @@ client.on('messageCreate', async (message) => {
 });
 
 // ==========================================
-// 5. Button Controls
+// 5. Button Handling
 // ==========================================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   const queue = queues.get(interaction.guildId);
-  if (!queue) return interaction.reply({ content: 'لا توجد قائمة تشغيل نشطة.', ephemeral: true });
+  if (!queue) return interaction.reply({ content: 'لا توجد قائمة نشطة.', ephemeral: true });
 
   if (interaction.member.voice.channelId !== queue.voiceChannel.id) {
-    return interaction.reply({ content: 'يجب أن تكون في نفس الروم الصوتي.', ephemeral: true });
+    return interaction.reply({ content: 'يجب أن تكون في نفس الروم.', ephemeral: true });
   }
 
   await interaction.deferUpdate().catch(() => {});
@@ -430,15 +425,13 @@ client.on('interactionCreate', async (interaction) => {
 
     case 'music_forward': {
       if (!queue.currentSong) return;
-      const targetTime = queue.currentSeconds + 10;
-      await playSong(queue, queue.currentSong, targetTime);
+      await playSong(queue, queue.currentSong, queue.currentSeconds + 10);
       break;
     }
 
     case 'music_back': {
       if (!queue.currentSong) return;
-      const targetTime = Math.max(0, queue.currentSeconds - 10);
-      await playSong(queue, queue.currentSong, targetTime);
+      await playSong(queue, queue.currentSong, Math.max(0, queue.currentSeconds - 10));
       break;
     }
 
@@ -456,7 +449,7 @@ client.on('interactionCreate', async (interaction) => {
       if (queue.songs.length > 0) {
         await playSong(queue, queue.songs[0], 0);
       } else {
-        queue.textChannel.send('✅ تم تخطي الأغنية وانتهت القائمة.').catch(() => {});
+        queue.textChannel.send('✅ انتهت القائمة.').catch(() => {});
         destroyQueue(queue.guildId);
       }
       break;
@@ -488,20 +481,17 @@ client.on('interactionCreate', async (interaction) => {
 
     case 'music_stop': {
       destroyQueue(queue.guildId);
-      await interaction.editReply({ content: '🛑 تم إيقاف التشغيل والمغادرة.', components: [] }).catch(() => {});
+      await interaction.editReply({ content: '🛑 تم إيقاف التشغيل.', components: [] }).catch(() => {});
       break;
     }
   }
 });
 
-// ==========================================
-// 6. Login
-// ==========================================
 client.once('ready', () => {
-  console.log(`[DISCORD] Logged in successfully as ${client.user.tag}`);
+  console.log(`[DISCORD] Logged in as ${client.user.tag}`);
 });
 
 client.login(TOKEN).catch((err) => {
-  console.error('[FATAL] Client login error:', err.message);
+  console.error('[FATAL] Login error:', err.message);
   process.exit(1);
 });
